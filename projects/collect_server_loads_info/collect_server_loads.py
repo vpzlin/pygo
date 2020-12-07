@@ -110,7 +110,7 @@ def start_collect():
             time.sleep(3)
 
         """ 清除历史数据 """
-        do_sql("delete from server_loads where scan_dt < date('now', '-{0} day');".format(0))
+        do_sql("delete from server_loads where scan_dt < date('now', '-{0} day');".format(records_remain_days))
         do_sql("VACUUM")
         logging.info('删除了表 server_loads 中字段 scan_dt 值是 {0} 天前的数据。'.format(records_remain_days))
 
