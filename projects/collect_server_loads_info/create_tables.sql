@@ -1,5 +1,20 @@
--- 表: 服务器列表create table if not exists server_list(    server     varchar(19)               -- 服务器IP或服务器名   ,enable     int                       -- 是否可用: 0否, 1是   ,username   varchar(20)               -- 用户名   ,password   varchar(100)              -- 密码   ,create_dt  date                      -- 记录创建时间   ,remark     varchar(400)              -- 备注   ,primary key(server));
--- 表: 服务器负载create table if not exists server_loads(    scan_dt                         varchar(19)       -- 扫描时间   ,server                          varchar(100)      -- 服务器IP或服务器名   ,is_succeed                      int               -- 是否扫描成功:1为成功,0为失败
+-- 表: 服务器列表
+create table if not exists server_list(
+    server     varchar(19)               -- 服务器IP或服务器名
+   ,enable     int                       -- 是否可用: 0否, 1是
+   ,username   varchar(20)               -- 用户名
+   ,password   varchar(100)              -- 密码
+   ,create_dt  date                      -- 记录创建时间
+   ,remark     varchar(400)              -- 备注
+   ,primary key(server)
+);
+
+
+-- 表: 服务器负载
+create table if not exists server_loads(
+    scan_dt                         varchar(19)       -- 扫描时间
+   ,server                          varchar(100)      -- 服务器IP或服务器名
+   ,is_succeed                      int               -- 是否扫描成功:1为成功,0为失败
    ,create_dt                       date              -- 记录创建时间
    ,remark                          varchar(400)      -- 备注
    ,disk_all_mounted_total_kb       real
@@ -60,7 +75,9 @@
    ,uptime_load_average_5min        real
    ,uptime_load_average_1min        real
    ,uptime_user_connections         real
-   ,result_uptime_runtime           real
-   ,hostname                        varchar(400)   ,primary key(scan_dt, server));
+   ,result_uptime_runtime           varchar(400)
+   ,hostname                        varchar(400)
+   ,primary key(scan_dt, server)
+);
 
 

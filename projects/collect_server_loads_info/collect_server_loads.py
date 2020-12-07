@@ -6,16 +6,22 @@ import paramiko
 import time
 import re
 import json
+import logging
+from queue import Queue
 from datetime import datetime
 
+logging.basicConfig(format='%(asctime)s | %(levelname)s | %(filename)s line:%(lineno)d | %(message)s',
+                    level=logging.INFO)
 
 """
 set running parameters
 """
-conn: sqlite3.Connection                # sqlite数据库连接
-scan_interval_seconds = 1000              # 扫描间隔（单位:秒）
-db_filename = 'server_loads_info.db'    # sqlite数据文件
-records_remain_days = 60                # 记录保留时间（单位：天）
+conn: sqlite3.Connection  # sqlite数据库连接
+sleep_interval_seconds = 10  # 生产者间隔（单位：秒）
+db_filename = 'server_loads_info.db'  # sqlite数据文件
+records_remain_days = 90  # 记录保留时间（单位：天）
+
+data_of_server_loads = Queue()  # 服务器负载数据队列
 
 # 字段间隔符
 space_mark = '|@|'
@@ -60,10 +66,9 @@ def init_db_tables():
         with open(file_create_tables_sql, mode='rb') as file:
             sql = file.read().decode().replace('\r', '\n')
             do_multi_sql(sql)
-            print('初始化SQLite数据库文件[{0}]完毕。\n'.format(db_filename))
+            logging.info('初始化SQLite数据库文件[{0}]完毕。'.format(db_filename))
     except Exception as e:
-        print('初始化SQLite数据库文件[{0}]失败！{1}\n'.format(db_filename, str(e)))
-        print('程序退出...')
+        logging.error('初始化SQLite数据库文件[{0}]失败，程序退出！{1}\n'.format(db_filename, str(e)))
         sys.exit(1)
 
 
@@ -85,20 +90,33 @@ def start_collect():
     :return:
     """
     while True:
-        # 获取待查负载的服务器
+        num = 0  # 计数器
         results = do_sql("select server, username, password from server_list where enable = 1")
+
+        """ 收集负载数据 """
         scan_dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 收集负载信息的线程
         for server, username, password in results:
-            print('开始搜集服务器[{0}]的负载。'.format(server))
-            t = threading.Thread(target=collect_info, args=(scan_dt, server, username, password))
-            t.start()
+            logging.debug('开始搜集服务器[{0}]的负载。'.format(server))
+            t_scan = threading.Thread(target=get_info, args=(scan_dt, server, username, password))
+            t_scan.start()
+
+        """ 保存负载数据到SQLite中 """
+        while num < len(results):
+            while data_of_server_loads.empty() is False:
+                data = data_of_server_loads.get()
+                save_data_to_db(data)
+                num += 1
+            time.sleep(3)
+
+        """ 清除历史数据 """
+        do_sql("delete from server_loads where scan_dt < date('now', '-{0} day');".format(0))
+        do_sql("VACUUM")
+        logging.info('删除了表 server_loads 中字段 scan_dt 值是 {0} 天前的数据。'.format(records_remain_days))
+
         # 进程休眠
-        print('进程休眠 {0}秒'.format(scan_interval_seconds))
-        time.sleep(scan_interval_seconds)
-
-    #
-
-    return True
+        logging.debug('本轮收集负载信息完毕，扫描进程休眠 {0} 秒...'.format(sleep_interval_seconds))
+        time.sleep(sleep_interval_seconds)
 
 
 def get_info_uptime(ssh: paramiko.SSHClient):
@@ -118,9 +136,9 @@ def get_info_uptime(ssh: paramiko.SSHClient):
     results['uptime_load_average_1min'] = args.pop().split(' ').pop()
     results['uptime_user_connections'] = args.pop().strip().split(' ')[0]
     args1 = args[0].split(' ')
-    del args1[0]    # 删除当前时间
-    del args1[0]    # 删除'up'字符串
-    args[0] = ' '.join(args1)     # 系统运行时间
+    del args1[0]  # 删除当前时间
+    del args1[0]  # 删除'up'字符串
+    args[0] = ' '.join(args1)  # 系统运行时间
     results['result_uptime_runtime'] = re.sub(' +', ' ', ' '.join(args))
     return results
 
@@ -134,15 +152,15 @@ def get_info_free_mb(ssh: paramiko.SSHClient):
     lines = re.sub(' +', ' ', result_free_mb).split('\n')
     args_mem = re.sub(' +', ' ', lines[1]).split(' ')
     args_mem_swap = re.sub(' +', ' ', lines[2]).split(' ')
-    results['mem_total_mb']      = args_mem[1]
-    results['mem_used_mb']       = args_mem[2]
-    results['mem_free_mb']       = args_mem[3]
-    results['mem_shared_mb']     = args_mem[4]
+    results['mem_total_mb'] = args_mem[1]
+    results['mem_used_mb'] = args_mem[2]
+    results['mem_free_mb'] = args_mem[3]
+    results['mem_shared_mb'] = args_mem[4]
     results['mem_buff_cache_mb'] = args_mem[5]
-    results['mem_available_mb']  = args_mem[6]
+    results['mem_available_mb'] = args_mem[6]
     results['mem_swap_total_mb'] = args_mem_swap[1]
-    results['mem_swap_used_mb']  = args_mem_swap[2]
-    results['mem_swap_free_mb']  = args_mem_swap[3]
+    results['mem_swap_used_mb'] = args_mem_swap[2]
+    results['mem_swap_free_mb'] = args_mem_swap[3]
     return results
 
 
@@ -158,21 +176,21 @@ def get_info_net_dev(ssh: paramiko.SSHClient):
         del lines[2]
     # 解析信息
     args = lines[2].strip().split(' ')
-    results['net_receive_bytes']       = int(args[1].strip())
-    results['net_receive_packets']     = int(args[2].strip())
-    results['net_receive_errs']        = int(args[3].strip())
-    results['net_receive_drop']        = int(args[4].strip())
-    results['net_receive_fifo']        = int(args[5].strip())
-    results['net_receive_frame']       = int(args[6].strip())
-    results['net_receive_compressed']  = int(args[7].strip())
-    results['net_receive_multicast']   = int(args[8].strip())
-    results['net_transmit_bytes']      = int(args[9].strip())
-    results['net_transmit_packets']    = int(args[10].strip())
-    results['net_transmit_errs']       = int(args[11].strip())
-    results['net_transmit_drop']       = int(args[12].strip())
-    results['net_transmit_fifo']       = int(args[13].strip())
-    results['net_transmit_colls']      = int(args[14].strip())
-    results['net_transmit_carrier']    = int(args[15].strip())
+    results['net_receive_bytes'] = int(args[1].strip())
+    results['net_receive_packets'] = int(args[2].strip())
+    results['net_receive_errs'] = int(args[3].strip())
+    results['net_receive_drop'] = int(args[4].strip())
+    results['net_receive_fifo'] = int(args[5].strip())
+    results['net_receive_frame'] = int(args[6].strip())
+    results['net_receive_compressed'] = int(args[7].strip())
+    results['net_receive_multicast'] = int(args[8].strip())
+    results['net_transmit_bytes'] = int(args[9].strip())
+    results['net_transmit_packets'] = int(args[10].strip())
+    results['net_transmit_errs'] = int(args[11].strip())
+    results['net_transmit_drop'] = int(args[12].strip())
+    results['net_transmit_fifo'] = int(args[13].strip())
+    results['net_transmit_colls'] = int(args[14].strip())
+    results['net_transmit_carrier'] = int(args[15].strip())
     results['net_transmit_compressed'] = int(args[16].strip())
     return results
 
@@ -191,9 +209,9 @@ def get_info_disk_df(ssh: paramiko.SSHClient):
             args_mounted_path.append(last)
 
     # 统计挂载盘信息
-    disk_all_mounted_total_kb = 0       # 磁盘总挂载大小
-    disk_all_mounted_used_kb = 0        # 磁盘总使用大小
-    disk_all_mounted_available_kb = 0   # 磁盘总可用大小
+    disk_all_mounted_total_kb = 0  # 磁盘总挂载大小
+    disk_all_mounted_used_kb = 0  # 磁盘总使用大小
+    disk_all_mounted_available_kb = 0  # 磁盘总可用大小
     result_disk_all_mounted: dict = {}
     for mounted_path in args_mounted_path:
         std_in, std_out, std_err = ssh.exec_command('df ' + mounted_path)
@@ -232,14 +250,14 @@ def get_info_top_cpu(ssh: paramiko.SSHClient):
     for line in lines:
         if len(line) > 8 and line[0: 8] == '%Cpu(s):':
             cpu_lines.append(line.strip())
-    args_cpu_us = []   # 数组： 用户空间占用CPU百分比
-    args_cpu_sy = []   # 数组： 内核空间占用CPU百分比
-    args_cpu_ni = []   # 数组： 用户进程空间内改变过优先级的进程占用CPU百分比
-    args_cpu_id = []   # 数组： 空闲CPU百分比
-    args_cpu_wa = []   # 数组： 等待输入输出的CPU时间百分比
-    args_cpu_hi = []   # 数组： 硬件CPU中断占用百分比
-    args_cpu_si = []   # 数组： 软中断占用百分比
-    args_cpu_st = []   # 数组： 虚拟机占用百分比
+    args_cpu_us = []  # 数组： 用户空间占用CPU百分比
+    args_cpu_sy = []  # 数组： 内核空间占用CPU百分比
+    args_cpu_ni = []  # 数组： 用户进程空间内改变过优先级的进程占用CPU百分比
+    args_cpu_id = []  # 数组： 空闲CPU百分比
+    args_cpu_wa = []  # 数组： 等待输入输出的CPU时间百分比
+    args_cpu_hi = []  # 数组： 硬件CPU中断占用百分比
+    args_cpu_si = []  # 数组： 软中断占用百分比
+    args_cpu_st = []  # 数组： 虚拟机占用百分比
     for cpu_line in cpu_lines:
         args_cpu_info = cpu_line.split(',')
         args_cpu_us.append(float(args_cpu_info[0].strip().split(' ')[1]))
@@ -254,35 +272,35 @@ def get_info_top_cpu(ssh: paramiko.SSHClient):
     # 用户空间占用CPU百分比
     results['cpu_us_max'] = max(args_cpu_us)
     results['cpu_us_min'] = min(args_cpu_us)
-    results['cpu_us_avg'] = int(sum(args_cpu_us) / len(args_cpu_us) * 100) / 100    # 乘100再除100，是为了处理float精度问题
+    results['cpu_us_avg'] = int(sum(args_cpu_us) / len(args_cpu_us) * 100) / 100  # 乘100再除100，是为了处理float精度问题
     # 内核空间占用CPU百分比
     results['cpu_sy_max'] = max(args_cpu_sy)
     results['cpu_sy_min'] = min(args_cpu_sy)
-    results['cpu_sy_avg'] = int(sum(args_cpu_sy) / len(args_cpu_sy) * 100) / 100    # 乘100再除100，是为了处理float精度问题
+    results['cpu_sy_avg'] = int(sum(args_cpu_sy) / len(args_cpu_sy) * 100) / 100  # 乘100再除100，是为了处理float精度问题
     # 用户进程空间内改变过优先级的进程占用CPU百分比
     results['cpu_ni_max'] = max(args_cpu_ni)
     results['cpu_ni_min'] = min(args_cpu_ni)
-    results['cpu_ni_avg'] = int(sum(args_cpu_ni) / len(args_cpu_ni) * 100) / 100    # 乘100再除100，是为了处理float精度问题
+    results['cpu_ni_avg'] = int(sum(args_cpu_ni) / len(args_cpu_ni) * 100) / 100  # 乘100再除100，是为了处理float精度问题
     # 空闲CPU百分比
     results['cpu_id_max'] = max(args_cpu_id)
     results['cpu_id_min'] = min(args_cpu_id)
-    results['cpu_id_avg'] = int(sum(args_cpu_id) / len(args_cpu_id) * 100) / 100    # 乘100再除100，是为了处理float精度问题
+    results['cpu_id_avg'] = int(sum(args_cpu_id) / len(args_cpu_id) * 100) / 100  # 乘100再除100，是为了处理float精度问题
     # 等待输入输出的CPU时间百分比
     results['cpu_wa_max'] = max(args_cpu_wa)
     results['cpu_wa_min'] = min(args_cpu_wa)
-    results['cpu_wa_avg'] = int(sum(args_cpu_wa) / len(args_cpu_wa) * 100) / 100    # 乘100再除100，是为了处理float精度问题
+    results['cpu_wa_avg'] = int(sum(args_cpu_wa) / len(args_cpu_wa) * 100) / 100  # 乘100再除100，是为了处理float精度问题
     # 硬件CPU中断占用百分比
     results['cpu_hi_max'] = max(args_cpu_hi)
     results['cpu_hi_min'] = min(args_cpu_hi)
-    results['cpu_hi_avg'] = int(sum(args_cpu_hi) / len(args_cpu_hi) * 100) / 100    # 乘100再除100，是为了处理float精度问题
+    results['cpu_hi_avg'] = int(sum(args_cpu_hi) / len(args_cpu_hi) * 100) / 100  # 乘100再除100，是为了处理float精度问题
     # 软中断占用百分比
     results['cpu_si_max'] = max(args_cpu_si)
     results['cpu_si_min'] = min(args_cpu_si)
-    results['cpu_si_avg'] = int(sum(args_cpu_si) / len(args_cpu_si) * 100) / 100    # 乘100再除100，是为了处理float精度问题
+    results['cpu_si_avg'] = int(sum(args_cpu_si) / len(args_cpu_si) * 100) / 100  # 乘100再除100，是为了处理float精度问题
     # 虚拟机占用百分比
     results['cpu_st_max'] = max(args_cpu_st)
     results['cpu_st_min'] = min(args_cpu_st)
-    results['cpu_st_avg'] = int(sum(args_cpu_st) / len(args_cpu_st) * 100) / 100    # 乘100再除100，是为了处理float精度问题
+    results['cpu_st_avg'] = int(sum(args_cpu_st) / len(args_cpu_st) * 100) / 100  # 乘100再除100，是为了处理float精度问题
 
     return results
 
@@ -296,12 +314,21 @@ def get_info_hostname(ssh: paramiko.SSHClient):
     return results
 
 
-def collect_info(scan_dt: str, server: str, username: str = '', password: str = ''):
+def get_info(scan_dt: str, server: str, username: str = '', password: str = ''):
+    """
+    生产者： 服务器负载信息
+    :param scan_dt: 扫描时间
+    :param server: 服务器
+    :param username: 用户名
+    :param password: 密码
+    :return: None
+    """
+    global data_of_server_loads
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    create_dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+    results: dict = {'scan_dt': scan_dt, 'server': server}
+
     try:
-        results: dict = {}
         """ 连接服务器 """
         if len(username.strip()) == 0:
             # private_key = paramiko.RSAKey.from_private_key_file('~/.ssh/id_rsa')
@@ -310,110 +337,239 @@ def collect_info(scan_dt: str, server: str, username: str = '', password: str = 
             ssh.connect(hostname=server, port=22, username=username, password=password)
 
         """ 获取统计信息 """
-        results = dict(get_info_hostname(ssh), **results)       # 主机名
-        results = dict(get_info_uptime(ssh), **results)         # uptime信息
-        results = dict(get_info_top_cpu(ssh), **results)        # top中的cpu信息
-        results = dict(get_info_free_mb(ssh), **results)        # free -m 中的内存信息
-        results = dict(get_info_net_dev(ssh), **results)        # 网卡负载信息
-        results = dict(get_info_disk_df(ssh), **results)        # 磁盘负载
+        results = dict(get_info_hostname(ssh), **results)  # 主机名
+        results = dict(get_info_uptime(ssh), **results)  # uptime信息
+        results = dict(get_info_top_cpu(ssh), **results)  # top中的cpu信息
+        results = dict(get_info_free_mb(ssh), **results)  # free -m 中的内存信息
+        results = dict(get_info_net_dev(ssh), **results)  # 网卡负载信息
+        results = dict(get_info_disk_df(ssh), **results)  # 磁盘负载
 
-        """ 统计完，断开连接服务器 """
+        results['is_succeed'] = 1
+        results['remark'] = ''
         ssh.close()
-
-        # 插入负载数据
-        sql = "insert into server_loads(                                                                          \n" \
-              "    scan_dt                         -- 扫描时间                                                     \n" \
-              "   ,server                          -- 服务器IP或服务器名                                             \n" \
-              "   ,is_succeed                      -- 是否扫描成功:1为成功,0为失败                                     \n" \
-              "   ,create_dt                       -- 记录创建时间                                                  \n" \
-              "   ,remark                          -- 备注                                                         \n" \
-              "   ,disk_all_mounted_total_kb                                                                      \n" \
-              "   ,disk_all_mounted_used_kb                                                                       \n" \
-              "   ,disk_all_mounted_available_kb                                                                  \n" \
-              "   ,disk_all_mounted_used_percent                                                                  \n" \
-              "   ,disk_detail                                                                                    \n" \
-              "   ,net_receive_bytes                                                                              \n" \
-              "   ,net_receive_packets                                                                            \n" \
-              "   ,net_receive_errs                                                                               \n" \
-              "   ,net_receive_drop                                                                               \n" \
-              "   ,net_receive_fifo                                                                               \n" \
-              "   ,net_receive_frame                                                                              \n" \
-              "   ,net_receive_compressed                                                                         \n" \
-              "   ,net_receive_multicast                                                                          \n" \
-              "   ,net_transmit_bytes                                                                             \n" \
-              "   ,net_transmit_packets                                                                           \n" \
-              "   ,net_transmit_errs                                                                              \n" \
-              "   ,net_transmit_drop                                                                              \n" \
-              "   ,net_transmit_fifo                                                                              \n" \
-              "   ,net_transmit_colls                                                                             \n" \
-              "   ,net_transmit_carrier                                                                           \n" \
-              "   ,net_transmit_compressed                                                                        \n" \
-              "   ,mem_total_mb                                                                                   \n" \
-              "   ,mem_used_mb                                                                                    \n" \
-              "   ,mem_free_mb                                                                                    \n" \
-              "   ,mem_shared_mb                                                                                  \n" \
-              "   ,mem_buff_cache_mb                                                                              \n" \
-              "   ,mem_available_mb                                                                               \n" \
-              "   ,mem_swap_total_mb                                                                              \n" \
-              "   ,mem_swap_used_mb                                                                               \n" \
-              "   ,mem_swap_free_mb                                                                               \n" \
-              "   ,cpu_us_max                                                                                     \n" \
-              "   ,cpu_us_min                                                                                     \n" \
-              "   ,cpu_us_avg                                                                                     \n" \
-              "   ,cpu_sy_max                                                                                     \n" \
-              "   ,cpu_sy_min                                                                                     \n" \
-              "   ,cpu_sy_avg                                                                                     \n" \
-              "   ,cpu_ni_max                                                                                     \n" \
-              "   ,cpu_ni_min                                                                                     \n" \
-              "   ,cpu_ni_avg                                                                                     \n" \
-              "   ,cpu_id_max                                                                                     \n" \
-              "   ,cpu_id_min                                                                                     \n" \
-              "   ,cpu_id_avg                                                                                     \n" \
-              "   ,cpu_wa_max                                                                                     \n" \
-              "   ,cpu_wa_min                                                                                     \n" \
-              "   ,cpu_wa_avg                                                                                     \n" \
-              "   ,cpu_hi_max                                                                                     \n" \
-              "   ,cpu_hi_min                                                                                     \n" \
-              "   ,cpu_hi_avg                                                                                     \n" \
-              "   ,cpu_si_max                                                                                     \n" \
-              "   ,cpu_si_min                                                                                     \n" \
-              "   ,cpu_si_avg                                                                                     \n" \
-              "   ,cpu_st_max                                                                                     \n" \
-              "   ,cpu_st_min                                                                                     \n" \
-              "   ,cpu_st_avg                                                                                     \n" \
-              "   ,uptime_load_average_15min                                                                      \n" \
-              "   ,uptime_load_average_5min                                                                       \n" \
-              "   ,uptime_load_average_1min                                                                       \n" \
-              "   ,uptime_user_connections                                                                        \n" \
-              "   ,result_uptime_runtime                                                                          \n" \
-              "   ,hostname                                                                                       \n" \
-              ") values(                                                                                          \n" \
-              "    '{scan_dt}', '{server}', '{is_succeed}', '{create_dt}', '{remark}'                             \n" \
-              "    ,{disk_all_mounted_total_kb}, {disk_all_mounted_used_kb}, {disk_all_mounted_available_kb}, {disk_all_mounted_used_percent}, '{disk_detail}' \n" \
-              "    ,{net_receive_bytes}, {net_receive_packets}, {net_receive_errs}, {net_receive_drop}, {net_receive_fifo}, {net_receive_frame}, {net_receive_compressed}, {net_receive_multicast}, {net_transmit_bytes}, {net_transmit_packets}, {net_transmit_errs}, {net_transmit_drop}, {net_transmit_fifo}, {net_transmit_colls}, {net_transmit_carrier}, {net_transmit_compressed}  \n" \
-              "    ,{mem_total_mb}, {mem_used_mb}, {mem_free_mb}, {mem_shared_mb}, {mem_buff_cache_mb}, {mem_available_mb}, {mem_swap_total_mb}, {mem_swap_used_mb}, {mem_swap_free_mb} \n " \
-              "    ,{cpu_us_max}, {cpu_us_min}, {cpu_us_avg}, {cpu_sy_max}, {cpu_sy_min}, {cpu_sy_avg}, {cpu_ni_max}, {cpu_ni_min}, {cpu_ni_avg}, {cpu_id_max}, {cpu_id_min}, {cpu_id_avg}, {cpu_wa_max}, {cpu_wa_min}, {cpu_wa_avg}, {cpu_hi_max}, {cpu_hi_min}, {cpu_hi_avg}, {cpu_si_max}, {cpu_si_min}, {cpu_si_avg}, {cpu_st_max}, {cpu_st_min}, {cpu_st_avg} \n " \
-              "    ,{uptime_load_average_15min}, {uptime_load_average_5min}, {uptime_load_average_1min}, {uptime_user_connections}, {result_uptime_runtime} \n "\
-              "    ,{hostname} \n " \
-              ");" \
-            .format(scan_dt=results['scan_dt'], server=results['server'], is_succeed=results['is_succeed'], create_dt=results['create_dt'], remark='',
-                    disk_all_mounted_total_kb=results['disk_all_mounted_total_kb'], disk_all_mounted_used_kb=results['disk_all_mounted_used_kb'], disk_all_mounted_available_kb=results['disk_all_mounted_available_kb'], disk_all_mounted_used_percent=results['disk_all_mounted_used_percent'], disk_detail=results['disk_detail'],
-                    net_receive_bytes=results['net_receive_bytes'], net_receive_packets=results['net_receive_packets'], net_receive_errs=results['net_receive_errs'], net_receive_drop=results['net_receive_drop'], net_receive_fifo=results['net_receive_fifo'], net_receive_frame=results['net_receive_frame'], net_receive_compressed=results['net_receive_compressed'], net_receive_multicast=results['net_receive_multicast'], net_transmit_bytes=results['net_transmit_bytes'], net_transmit_packets=results['net_transmit_packets'], net_transmit_errs=results['net_transmit_errs'], net_transmit_drop=results['net_transmit_drop'], net_transmit_fifo=results['net_transmit_fifo'], net_transmit_colls=results['net_transmit_colls'], net_transmit_carrier=results['net_transmit_carrier'], net_transmit_compressed=results['net_transmit_compressed'],
-                    mem_total_mb=results['mem_total_mb'], mem_used_mb=results['mem_used_mb'], mem_free_mb=results['mem_free_mb'], mem_shared_mb=results['mem_shared_mb'], mem_buff_cache_mb=results['mem_buff_cache_mb'], mem_available_mb=results['mem_available_mb'], mem_swap_total_mb=results['mem_swap_total_mb'], mem_swap_used_mb=results['mem_swap_used_mb'], mem_swap_free_mb=results['mem_swap_free_mb'],
-                    cpu_us_max=results['cpu_us_max'], cpu_us_min=results['cpu_us_min'], cpu_us_avg=results['cpu_us_avg'], cpu_sy_max=results['cpu_sy_max'], cpu_sy_min=results['cpu_sy_min'], cpu_sy_avg=results['cpu_sy_avg'], cpu_ni_max=results['cpu_ni_max'], cpu_ni_min=results['cpu_ni_min'], cpu_ni_avg=results['cpu_ni_avg'], cpu_id_max=results['cpu_id_max'], cpu_id_min=results['cpu_id_min'], cpu_id_avg=results['cpu_id_avg'], cpu_wa_max=results['cpu_wa_max'], cpu_wa_min=results['cpu_wa_min'], cpu_wa_avg=results['cpu_wa_avg'], cpu_hi_max=results['cpu_hi_max'], cpu_hi_min=results['cpu_hi_min'], cpu_hi_avg=results['cpu_hi_avg'], cpu_si_max=results['cpu_si_max'], cpu_si_min=results['cpu_si_min'], cpu_si_avg=results['cpu_si_avg'], cpu_st_max=results['cpu_st_max'], cpu_st_min=results['cpu_st_min'], cpu_st_avg=results['cpu_st_avg'],
-                    uptime_load_average_15min=results['uptime_load_average_15min'], uptime_load_average_5min=results['uptime_load_average_5min'], uptime_load_average_1min=results['uptime_load_average_1min'], uptime_user_connections=results['uptime_user_connections'], result_uptime_runtime=results['result_uptime_runtime'],
-                    hostname=results['hostname'] )
-        do_sql(sql)
     except Exception as e:
-        sql = "insert into server_loads(    \n" \
-              "    scan_dt                  \n" \
-              "   ,server                   \n" \
-              "   ,is_succeed               \n" \
-              "   ,create_dt                \n" \
-              "   ,remark                   \n" \
-              ") values('{0}', '{1}', 0, '{2}', '{3}');"\
-            .format(scan_dt, server, 0, create_dt, '获取负载信息失败！' + str(e))
-        print(str(e))
+        results['is_succeed'] = 0
+        results['remark'] = '获取服务器负载信息失败！' + str(e)
+        logging.error('获取服务器[{0}]负载信息失败！{1}'.format(server, str(e)))
+    finally:
+        results['create_dt'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        data_of_server_loads.put(results)
+
+
+def save_data_to_db(data: dict):
+    """
+    保存数据到SQLite数据库中
+    :param data: 数据
+    :return:
+    """
+    if data['is_succeed'] == 1:
+        sql = "insert into server_loads(                          \n " \
+              "    scan_dt                                        \n " \
+              "   ,server                                         \n " \
+              "   ,is_succeed                                     \n " \
+              "   ,create_dt                                      \n " \
+              "   ,remark                                         \n " \
+              "   ,disk_all_mounted_total_kb                      \n " \
+              "   ,disk_all_mounted_used_kb                       \n " \
+              "   ,disk_all_mounted_available_kb                  \n " \
+              "   ,disk_all_mounted_used_percent                  \n " \
+              "   ,disk_detail                                    \n " \
+              "   ,net_receive_bytes                              \n " \
+              "   ,net_receive_packets                            \n " \
+              "   ,net_receive_errs                               \n " \
+              "   ,net_receive_drop                               \n " \
+              "   ,net_receive_fifo                               \n " \
+              "   ,net_receive_frame                              \n " \
+              "   ,net_receive_compressed                         \n " \
+              "   ,net_receive_multicast                          \n " \
+              "   ,net_transmit_bytes                             \n " \
+              "   ,net_transmit_packets                           \n " \
+              "   ,net_transmit_errs                              \n " \
+              "   ,net_transmit_drop                              \n " \
+              "   ,net_transmit_fifo                              \n " \
+              "   ,net_transmit_colls                             \n " \
+              "   ,net_transmit_carrier                           \n " \
+              "   ,net_transmit_compressed                        \n " \
+              "   ,mem_total_mb                                   \n " \
+              "   ,mem_used_mb                                    \n " \
+              "   ,mem_free_mb                                    \n " \
+              "   ,mem_shared_mb                                  \n " \
+              "   ,mem_buff_cache_mb                              \n " \
+              "   ,mem_available_mb                               \n " \
+              "   ,mem_swap_total_mb                              \n " \
+              "   ,mem_swap_used_mb                               \n " \
+              "   ,mem_swap_free_mb                               \n " \
+              "   ,cpu_us_max                                     \n " \
+              "   ,cpu_us_min                                     \n " \
+              "   ,cpu_us_avg                                     \n " \
+              "   ,cpu_sy_max                                     \n " \
+              "   ,cpu_sy_min                                     \n " \
+              "   ,cpu_sy_avg                                     \n " \
+              "   ,cpu_ni_max                                     \n " \
+              "   ,cpu_ni_min                                     \n " \
+              "   ,cpu_ni_avg                                     \n " \
+              "   ,cpu_id_max                                     \n " \
+              "   ,cpu_id_min                                     \n " \
+              "   ,cpu_id_avg                                     \n " \
+              "   ,cpu_wa_max                                     \n " \
+              "   ,cpu_wa_min                                     \n " \
+              "   ,cpu_wa_avg                                     \n " \
+              "   ,cpu_hi_max                                     \n " \
+              "   ,cpu_hi_min                                     \n " \
+              "   ,cpu_hi_avg                                     \n " \
+              "   ,cpu_si_max                                     \n " \
+              "   ,cpu_si_min                                     \n " \
+              "   ,cpu_si_avg                                     \n " \
+              "   ,cpu_st_max                                     \n " \
+              "   ,cpu_st_min                                     \n " \
+              "   ,cpu_st_avg                                     \n " \
+              "   ,uptime_load_average_15min                      \n " \
+              "   ,uptime_load_average_5min                       \n " \
+              "   ,uptime_load_average_1min                       \n " \
+              "   ,uptime_user_connections                        \n " \
+              "   ,result_uptime_runtime                          \n " \
+              "   ,hostname)                                      \n " \
+              "values(                                            \n " \
+              "    '{scan_dt}'                                    \n " \
+              "   ,'{server}'                                     \n " \
+              "   ,{is_succeed}                                   \n " \
+              "   ,'{create_dt}'                                  \n " \
+              "   ,'{remark}'                                     \n " \
+              "   ,{disk_all_mounted_total_kb}                    \n " \
+              "   ,{disk_all_mounted_used_kb}                     \n " \
+              "   ,{disk_all_mounted_available_kb}                \n " \
+              "   ,{disk_all_mounted_used_percent}                \n " \
+              "   ,'{disk_detail}'                                \n " \
+              "   ,{net_receive_bytes}                            \n " \
+              "   ,{net_receive_packets}                          \n " \
+              "   ,{net_receive_errs}                             \n " \
+              "   ,{net_receive_drop}                             \n " \
+              "   ,{net_receive_fifo}                             \n " \
+              "   ,{net_receive_frame}                            \n " \
+              "   ,{net_receive_compressed}                       \n " \
+              "   ,{net_receive_multicast}                        \n " \
+              "   ,{net_transmit_bytes}                           \n " \
+              "   ,{net_transmit_packets}                         \n " \
+              "   ,{net_transmit_errs}                            \n " \
+              "   ,{net_transmit_drop}                            \n " \
+              "   ,{net_transmit_fifo}                            \n " \
+              "   ,{net_transmit_colls}                           \n " \
+              "   ,{net_transmit_carrier}                         \n " \
+              "   ,{net_transmit_compressed}                      \n " \
+              "   ,{mem_total_mb}                                 \n " \
+              "   ,{mem_used_mb}                                  \n " \
+              "   ,{mem_free_mb}                                  \n " \
+              "   ,{mem_shared_mb}                                \n " \
+              "   ,{mem_buff_cache_mb}                            \n " \
+              "   ,{mem_available_mb}                             \n " \
+              "   ,{mem_swap_total_mb}                            \n " \
+              "   ,{mem_swap_used_mb}                             \n " \
+              "   ,{mem_swap_free_mb}                             \n " \
+              "   ,{cpu_us_max}                                   \n " \
+              "   ,{cpu_us_min}                                   \n " \
+              "   ,{cpu_us_avg}                                   \n " \
+              "   ,{cpu_sy_max}                                   \n " \
+              "   ,{cpu_sy_min}                                   \n " \
+              "   ,{cpu_sy_avg}                                   \n " \
+              "   ,{cpu_ni_max}                                   \n " \
+              "   ,{cpu_ni_min}                                   \n " \
+              "   ,{cpu_ni_avg}                                   \n " \
+              "   ,{cpu_id_max}                                   \n " \
+              "   ,{cpu_id_min}                                   \n " \
+              "   ,{cpu_id_avg}                                   \n " \
+              "   ,{cpu_wa_max}                                   \n " \
+              "   ,{cpu_wa_min}                                   \n " \
+              "   ,{cpu_wa_avg}                                   \n " \
+              "   ,{cpu_hi_max}                                   \n " \
+              "   ,{cpu_hi_min}                                   \n " \
+              "   ,{cpu_hi_avg}                                   \n " \
+              "   ,{cpu_si_max}                                   \n " \
+              "   ,{cpu_si_min}                                   \n " \
+              "   ,{cpu_si_avg}                                   \n " \
+              "   ,{cpu_st_max}                                   \n " \
+              "   ,{cpu_st_min}                                   \n " \
+              "   ,{cpu_st_avg}                                   \n " \
+              "   ,{uptime_load_average_15min}                    \n " \
+              "   ,{uptime_load_average_5min}                     \n " \
+              "   ,{uptime_load_average_1min}                     \n " \
+              "   ,{uptime_user_connections}                      \n " \
+              "   ,'{result_uptime_runtime}'                      \n " \
+              "   ,'{hostname}'                                   \n " \
+              ");".format(scan_dt=data['scan_dt'],
+                          server=data['server'],
+                          is_succeed=data['is_succeed'],
+                          create_dt=data['create_dt'],
+                          remark=data['remark'],
+                          disk_all_mounted_total_kb=data['disk_all_mounted_total_kb'],
+                          disk_all_mounted_used_kb=data['disk_all_mounted_used_kb'],
+                          disk_all_mounted_available_kb=data['disk_all_mounted_available_kb'],
+                          disk_all_mounted_used_percent=data['disk_all_mounted_used_percent'],
+                          disk_detail=data['disk_detail'],
+                          net_receive_bytes=data['net_receive_bytes'],
+                          net_receive_packets=data['net_receive_packets'],
+                          net_receive_errs=data['net_receive_errs'],
+                          net_receive_drop=data['net_receive_drop'],
+                          net_receive_fifo=data['net_receive_fifo'],
+                          net_receive_frame=data['net_receive_frame'],
+                          net_receive_compressed=data['net_receive_compressed'],
+                          net_receive_multicast=data['net_receive_multicast'],
+                          net_transmit_bytes=data['net_transmit_bytes'],
+                          net_transmit_packets=data['net_transmit_packets'],
+                          net_transmit_errs=data['net_transmit_errs'],
+                          net_transmit_drop=data['net_transmit_drop'],
+                          net_transmit_fifo=data['net_transmit_fifo'],
+                          net_transmit_colls=data['net_transmit_colls'],
+                          net_transmit_carrier=data['net_transmit_carrier'],
+                          net_transmit_compressed=data['net_transmit_compressed'],
+                          mem_total_mb=data['mem_total_mb'],
+                          mem_used_mb=data['mem_used_mb'],
+                          mem_free_mb=data['mem_free_mb'],
+                          mem_shared_mb=data['mem_shared_mb'],
+                          mem_buff_cache_mb=data['mem_buff_cache_mb'],
+                          mem_available_mb=data['mem_available_mb'],
+                          mem_swap_total_mb=data['mem_swap_total_mb'],
+                          mem_swap_used_mb=data['mem_swap_used_mb'],
+                          mem_swap_free_mb=data['mem_swap_free_mb'],
+                          cpu_us_max=data['cpu_us_max'],
+                          cpu_us_min=data['cpu_us_min'],
+                          cpu_us_avg=data['cpu_us_avg'],
+                          cpu_sy_max=data['cpu_sy_max'],
+                          cpu_sy_min=data['cpu_sy_min'],
+                          cpu_sy_avg=data['cpu_sy_avg'],
+                          cpu_ni_max=data['cpu_ni_max'],
+                          cpu_ni_min=data['cpu_ni_min'],
+                          cpu_ni_avg=data['cpu_ni_avg'],
+                          cpu_id_max=data['cpu_id_max'],
+                          cpu_id_min=data['cpu_id_min'],
+                          cpu_id_avg=data['cpu_id_avg'],
+                          cpu_wa_max=data['cpu_wa_max'],
+                          cpu_wa_min=data['cpu_wa_min'],
+                          cpu_wa_avg=data['cpu_wa_avg'],
+                          cpu_hi_max=data['cpu_hi_max'],
+                          cpu_hi_min=data['cpu_hi_min'],
+                          cpu_hi_avg=data['cpu_hi_avg'],
+                          cpu_si_max=data['cpu_si_max'],
+                          cpu_si_min=data['cpu_si_min'],
+                          cpu_si_avg=data['cpu_si_avg'],
+                          cpu_st_max=data['cpu_st_max'],
+                          cpu_st_min=data['cpu_st_min'],
+                          cpu_st_avg=data['cpu_st_avg'],
+                          uptime_load_average_15min=data['uptime_load_average_15min'],
+                          uptime_load_average_5min=data['uptime_load_average_5min'],
+                          uptime_load_average_1min=data['uptime_load_average_1min'],
+                          uptime_user_connections=data['uptime_user_connections'],
+                          result_uptime_runtime=data['result_uptime_runtime'],
+                          hostname=data['hostname']
+                          )
+        do_sql(sql)
+
+    # 服务器统计负载信息失败
+    else:
+        sql = "insert into server_loads(scan_dt, server, is_succeed, create_dt, remark)  " \
+              "values('{scan_dt}', '{server}', {is_succeed}, '{create_dt}', '{remark}');" \
+            .format(scan_dt=data['scan_dt'], server=data['server'],
+                    is_succeed=data['is_succeed'], create_dt=data['create_dt'], remark=data['remark']
+                    )
         do_sql(sql)
 
 
@@ -426,7 +582,7 @@ def stop_collect():
     return True
 
 
-def load_servers(filepath: str):
+def load_servers_from_file(filepath: str):
     """
     加载服务器列表
     :param filepath: 服务器列表配置文件路径
@@ -440,7 +596,7 @@ def load_servers(filepath: str):
             lines = file.read().decode().replace('\r', '\n').split('\n')
             for line in lines:
                 args_line_info = line.strip().split(space_mark)
-                args_line_info[0] = args_line_info[0].replace('\t', '').replace(' ', '')    # 服务器地址去空格
+                args_line_info[0] = args_line_info[0].replace('\t', '').replace(' ', '')  # 服务器地址去空格
                 server = args_line_info[0]
                 username = args_line_info[1] if len(args_line_info) > 1 else ''
                 password = args_line_info[2] if len(args_line_info) > 2 else ''
@@ -450,10 +606,10 @@ def load_servers(filepath: str):
                         .format(server, username, password, create_dt)
                     server_list.append(server)
             do_multi_sql(sql)
-            print('导入文件[{0}]中的服务器列表成功！待扫描的服务器为：'.format(filepath) + ','.join(server_list))
+            logging.info('导入文件[{0}]中的服务器列表成功！待扫描的服务器为：'.format(filepath) + ','.join(server_list))
             return True
     except Exception as e:
-        print('打开文件[{0}]失败： \n{1}'.format(filepath, str(e)))
+        logging.error('打开文件[{0}]失败： \n{1}'.format(filepath, str(e)))
         return False
 
 
@@ -477,7 +633,7 @@ if __name__ == '__main__':
         if os.path.exists(file_path) is False:
             print('脚本运行失败，服务器列表文件[{0}]不存在！'.format(file_path))
             exit(1)
-        load_servers(file_path)
+        load_servers_from_file(file_path)
     else:
         print('脚本运行失败，输入参数错误！')
         tip_for_input()
